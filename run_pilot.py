@@ -1,3 +1,4 @@
+import argparse
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -31,21 +32,30 @@ class ScoredItem:
 
 
 class HFTextSafetyScorer:
-    def __init__(self, model_name: str, default_threshold: float = 0.5) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        default_threshold: float = 0.5,
+        agg_mode: str = "primary",
+    ) -> None:
         self.model_name = model_name
         self.default_threshold = default_threshold
+        self.agg_mode = agg_mode
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name).to(self.device)
         self.model.eval()
         self.id2label = {int(k): v for k, v in self.model.config.id2label.items()}
 
-    def _extract_primary_score(self, label_scores: Dict[str, float]) -> float:
-        # Prefer explicit toxicity/hate labels if present; otherwise take max score
+    def _extract_score(self, label_scores: Dict[str, float]) -> float:
+        if not label_scores:
+            return 0.0
+        if self.agg_mode == "max":
+            return max(label_scores.values())
         for candidate in ("toxic", "toxicity", "hate", "hate_speech"):
             if candidate in label_scores:
                 return label_scores[candidate]
-        return max(label_scores.values()) if label_scores else 0.0
+        return max(label_scores.values())
 
     @torch.inference_mode()
     def score(self, text: str) -> Tuple[float, Dict[str, float]]:
@@ -62,8 +72,8 @@ class HFTextSafetyScorer:
             self.id2label.get(i, f"label_{i}"): round(float(p), 4)
             for i, p in enumerate(probs)
         }
-        primary = self._extract_primary_score(label_scores)
-        return round(float(primary), 4), label_scores
+        selected = self._extract_score(label_scores)
+        return round(float(selected), 4), label_scores
 
 
 def load_jsonl(path: Path) -> List[EvalRecord]:
@@ -91,7 +101,6 @@ def compute_slice_metrics(
     threshold: float,
 ) -> Dict[str, Any]:
     subset = [x for x in scored_items if x.slice_name == slice_name]
-    by_id = {x.item_id: x for x in scored_items if x.slice_name == slice_name}
     base_by_id = {x.item_id: x for x in scored_items if x.slice_name == "standard_en"}
 
     tp = fp = tn = fn = 0
@@ -137,7 +146,6 @@ def evaluate_model(
     slices = list(records[0].texts.keys()) if records else []
     raw_scored: List[ScoredItem] = []
 
-    # First pass: score every item and slice
     temp_map: Dict[Tuple[str, str], Tuple[float, Dict[str, float], bool]] = {}
     for r in records:
         for s, txt in r.texts.items():
@@ -145,7 +153,6 @@ def evaluate_model(
             pred_def = sc >= scorer.default_threshold
             temp_map[(r.item_id, s)] = (sc, lbl_scores, pred_def)
 
-    # Second pass: attach baseline comparison at default threshold
     for r in records:
         base_pred_def = temp_map.get((r.item_id, "standard_en"), (0.0, {}, False))[2]
         for s, txt in r.texts.items():
@@ -180,18 +187,24 @@ def evaluate_model(
 def write_markdown_report(
     out_path: Path,
     model_results: List[Tuple[str, Dict[str, Dict[str, Any]], Dict[float, Dict[str, Dict[str, Any]]]]],
+    num_records: int,
+    num_slices: int,
+    threshold: float,
+    agg_mode: str,
     error_count: int,
 ) -> None:
+    total_inputs = num_records * num_slices
     lines: List[str] = [
         "# Pilot Evaluation: Multilingual & Dialectal Toxicity / Hate-Speech Detection",
         "",
-        f"- **Dataset size:** 24 paired intents × 3 slices (`standard_en`, `dialect_en`, `low_res`) = 72 inputs per model",
-        f"- **Total errors logged at default threshold (0.5):** {error_count} (see `pilot_errors.jsonl`)",
+        f"- **Dataset size:** {num_records} paired intents × {num_slices} slices (`standard_en`, `dialect_en`, `low_res`) = {total_inputs} inputs per model",
+        f"- **Active threshold / aggregation:** `{threshold}` / `{agg_mode}`",
+        f"- **Total errors logged at active threshold ({threshold}):** {error_count} (see `pilot_errors.jsonl`)",
         "",
     ]
 
     for model_name, default_summary, sweep_summary in model_results:
-        lines.append(f"## Model: `{model_name}` (Default Threshold = 0.5)")
+        lines.append(f"## Model: `{model_name}` (Threshold = {threshold}, Agg = `{agg_mode}`)")
         lines.append("")
         lines.append("| Slice | N | FNR | FPR | Flips vs. Standard EN | Mean Score |")
         lines.append("| :--- | :---: | :---: | :---: | :---: | :---: |")
@@ -220,12 +233,23 @@ def write_markdown_report(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Run multilingual/dialectal safety pilot.")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Decision threshold (default: 0.5)")
+    parser.add_argument(
+        "--agg",
+        choices=["primary", "max"],
+        default="primary",
+        help="Score aggregation mode: primary head vs max across all heads",
+    )
+    args = parser.parse_args()
+
     base_dir = Path(__file__).resolve().parent
     data_path = base_dir / "pilot_data.jsonl"
     errors_path = base_dir / "pilot_errors.jsonl"
     report_path = base_dir / "pilot_summary.md"
 
     records = load_jsonl(data_path)
+    num_slices = len(records[0].texts) if records else 0
     models = [
         "Horizon-Labs/multilingual-toxicity-small",
         "Horizon-Labs/multilingual-hate-speech-base",
@@ -236,8 +260,12 @@ def main() -> None:
     model_results = []
 
     for m_name in models:
-        print(f"Loading and evaluating {m_name}...")
-        scorer = HFTextSafetyScorer(model_name=m_name, default_threshold=0.5)
+        print(f"Loading and evaluating {m_name} (threshold={args.threshold}, agg={args.agg})...")
+        scorer = HFTextSafetyScorer(
+            model_name=m_name,
+            default_threshold=args.threshold,
+            agg_mode=args.agg,
+        )
         scored_items, default_summary, sweep_summary = evaluate_model(records, scorer, thresholds)
         model_results.append((m_name, default_summary, sweep_summary))
 
@@ -255,7 +283,15 @@ def main() -> None:
         for err in all_errors:
             ef.write(json.dumps(err, ensure_ascii=False) + "\n")
 
-    write_markdown_report(report_path, model_results, error_count=len(all_errors))
+    write_markdown_report(
+        report_path,
+        model_results,
+        num_records=len(records),
+        num_slices=num_slices,
+        threshold=args.threshold,
+        agg_mode=args.agg,
+        error_count=len(all_errors),
+    )
     print(f"\nDone. Wrote {len(all_errors)} errors to {errors_path.name} and summary to {report_path.name}.")
 
 
