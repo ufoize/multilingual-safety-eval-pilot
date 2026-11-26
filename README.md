@@ -17,5 +17,11 @@ Safety guardrails and content moderation classifiers are typically calibrated on
 ## Quickstart
 
 ```bash
+
+### CLI Options
+- `--threshold` (default: `0.5`): Decision threshold for binary harmful/non-harmful classification and flip detection.
+- `--agg` (`primary` or `max`, default: `primary`):
+  - `primary`: Uses the model's main `toxicity` / `hate` head.
+  - `max`: Uses the maximum probability across all output heads (e.g., `threat`, `insult`, `identity_hostility`).
 pip install torch transformers
 python run_pilot.py --threshold 0.3 --agg primary
