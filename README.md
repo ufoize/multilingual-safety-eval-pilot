@@ -14,14 +14,14 @@ Safety guardrails and content moderation classifiers are typically calibrated on
 - `run_pilot.py`: Inference and evaluation script supporting configurable decision thresholds (`--threshold`), label aggregation modes (`--agg primary|max`), slice-level FNR/FPR metrics, prediction flip tracking relative to `standard_en`, and threshold sweeps (`0.2`–`0.7`).
 - `pilot_summary.md`: Generated Markdown report summarizing slice-level metrics and threshold sweeps.
 
-## Quickstart
-
-```bash
-pip install torch transformers
-python run_pilot.py --threshold 0.3 --agg primary
-
 ### CLI Options
 - `--threshold` (default: `0.5`): Decision threshold for binary harmful/non-harmful classification and flip detection.
 - `--agg` (`primary` or `max`, default: `primary`):
   - `primary`: Uses the model's main `toxicity` / `hate` head.
   - `max`: Uses the maximum probability across all output heads (e.g., `threat`, `insult`, `identity_hostility`).
+
+## Quickstart
+
+```bash
+pip install torch transformers
+python run_pilot.py --threshold 0.3 --agg primary
